@@ -36,17 +36,25 @@ test("server-renders the EvidenceLock product shell", async () => {
 });
 
 test("ships the local-first analysis workflow without starter residue", async () => {
-  const [page, layout, packageJson] = await Promise.all([
+  const [page, layout, packageJson, engine, workflow] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
+    readFile(new URL("../lib/evidence-engine.ts", import.meta.url), "utf8"),
+    readFile(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8"),
   ]);
 
   assert.match(page, /mammoth/);
   assert.match(page, /pdfjs-dist/);
   assert.match(page, /loadSample/);
   assert.match(page, /exportReport/);
+  assert.match(page, /MAX_FILE_SIZE/);
+  assert.match(page, /cancelScan/);
   assert.match(page, /\.docx,\.pdf,\.txt,\.md,\.csv,\.tsv/);
+  assert.match(engine, /valuesEquivalent/);
+  assert.match(engine, /parseDelimitedLine/);
+  assert.match(workflow, /actions\/checkout@v6/);
+  assert.match(workflow, /npm test/);
   assert.match(layout, /\/og\.png/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
   await access(new URL("../public/og.png", import.meta.url));

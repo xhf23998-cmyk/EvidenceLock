@@ -764,7 +764,7 @@ a {
   border-top: 1px solid var(--line);
   display: grid;
   gap: 15px;
-  grid-template-columns: auto 1fr minmax(160px, 0.7fr);
+  grid-template-columns: auto 1fr minmax(160px, 0.7fr) auto;
   margin-top: 28px;
   padding-top: 24px;
 }
@@ -831,6 +831,21 @@ a {
   display: block;
   height: 100%;
   transition: width 300ms ease;
+}
+
+.scan-cancel {
+  background: transparent;
+  border: 0;
+  color: #68736d;
+  cursor: pointer;
+  font-size: 11px;
+  padding: 8px 4px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.scan-cancel:hover {
+  color: var(--red);
 }
 
 .report {
@@ -903,6 +918,13 @@ a {
   color: #aebbb4;
   font-size: 11px;
   margin: 7px 0 0;
+}
+
+.report-score-block .score-note {
+  color: #899890;
+  font-size: 10px;
+  line-height: 1.55;
+  max-width: 560px;
 }
 
 .report-actions {
@@ -1650,6 +1672,11 @@ footer > span {
 
   .progress-track {
     grid-column: 1 / -1;
+  }
+
+  .scan-cancel {
+    grid-column: 1 / -1;
+    justify-self: start;
   }
 
   .report-header {

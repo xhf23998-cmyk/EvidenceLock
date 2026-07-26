@@ -21,40 +21,24 @@ import {
   X,
 } from "lucide-react";
 import { ChangeEvent, DragEvent, useMemo, useRef, useState } from "react";
+import {
+  analyzeText,
+  scoreClaims,
+  type Claim,
+  type ClaimStatus,
+  type Severity,
+} from "@/lib/evidence-engine";
 
 type Asset = {
   name: string;
   size: number;
   type: string;
+  identity: string;
   file?: File;
   text?: string;
 };
 
-type ClaimStatus = "supported" | "conflict" | "unverified";
-type Severity = "high" | "medium" | "low";
 type ClaimFilter = "all" | "issues" | "high" | "supported";
-
-type SourceHit = {
-  key: string;
-  value: string;
-  file: string;
-  line: number;
-  excerpt: string;
-};
-
-type Claim = {
-  id: string;
-  key: string;
-  label: string;
-  value: string;
-  context: string;
-  line: number;
-  status: ClaimStatus;
-  severity: Severity;
-  reason: string;
-  suggestion: string;
-  source?: SourceHit;
-};
 
 type ScanResult = {
   score: number;
@@ -64,6 +48,9 @@ type ScanResult = {
 };
 
 const ACCEPTED = ".docx,.pdf,.txt,.md,.csv,.tsv";
+const MAX_FILE_SIZE = 25 * 1024 * 1024;
+const MAX_EVIDENCE_FILES = 20;
+const MAX_TOTAL_EVIDENCE_SIZE = 100 * 1024 * 1024;
 
 const SAMPLE_MANUSCRIPT = `多源信号融合模型的鲁棒性评估
 
@@ -99,47 +86,53 @@ function fileExtension(name: string) {
   return name.split(".").pop()?.toLowerCase() ?? "";
 }
 
-function stripXml(xml: string) {
-  const textarea =
-    typeof document !== "undefined" ? document.createElement("textarea") : null;
-  const withBreaks = xml
-    .replace(/<w:tab\/>/g, "\t")
-    .replace(/<\/w:p>/g, "\n")
-    .replace(/<\/w:tr>/g, "\n")
-    .replace(/<\/w:tc>/g, "\t")
-    .replace(/<[^>]+>/g, "");
-  if (!textarea) return withBreaks;
-  textarea.innerHTML = withBreaks;
-  return textarea.value;
+class ScanCancelledError extends Error {
+  constructor() {
+    super("核验已取消");
+    this.name = "ScanCancelledError";
+  }
 }
 
-async function readAssetText(asset: Asset): Promise<string> {
+function assertNotCancelled(shouldCancel?: () => boolean) {
+  if (shouldCancel?.()) throw new ScanCancelledError();
+}
+
+async function readAssetText(
+  asset: Asset,
+  shouldCancel?: () => boolean,
+): Promise<string> {
+  assertNotCancelled(shouldCancel);
   if (asset.text !== undefined) return asset.text;
   if (!asset.file) throw new Error(`无法读取 ${asset.name}`);
 
   const ext = fileExtension(asset.name);
-  if (["txt", "md", "csv", "tsv"].includes(ext)) return asset.file.text();
+  if (["txt", "md", "csv", "tsv"].includes(ext)) {
+    const text = await asset.file.text();
+    assertNotCancelled(shouldCancel);
+    return text;
+  }
 
   if (ext === "docx") {
     try {
       const mammoth = await import("mammoth");
+      assertNotCancelled(shouldCancel);
       const result = await mammoth.extractRawText({
         arrayBuffer: await asset.file.arrayBuffer(),
       });
+      assertNotCancelled(shouldCancel);
       return result.value;
-    } catch {
-      const JSZip = (await import("jszip")).default;
-      const zip = await JSZip.loadAsync(await asset.file.arrayBuffer());
-      const documentXml = await zip
-        .file("word/document.xml")
-        ?.async("string");
-      if (!documentXml) throw new Error("DOCX 中没有可读取的正文");
-      return stripXml(documentXml);
+    } catch (docxError) {
+      assertNotCancelled(shouldCancel);
+      throw new Error(
+        `${asset.name} 无法解析，请确认文件未损坏并重新保存为标准 DOCX。`,
+        { cause: docxError },
+      );
     }
   }
 
   if (ext === "pdf") {
     const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+    assertNotCancelled(shouldCancel);
     pdfjs.GlobalWorkerOptions.workerSrc = new URL(
       "pdfjs-dist/legacy/build/pdf.worker.mjs",
       import.meta.url,
@@ -150,6 +143,7 @@ async function readAssetText(asset: Asset): Promise<string> {
     }).promise;
     const pages: string[] = [];
     for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+      assertNotCancelled(shouldCancel);
       const page = await pdf.getPage(pageNumber);
       const content = await page.getTextContent();
       pages.push(
@@ -158,218 +152,16 @@ async function readAssetText(asset: Asset): Promise<string> {
           .join(" "),
       );
     }
-    return pages.join("\n");
+    const text = pages.join("\n").trim();
+    if (text.length < 10) {
+      throw new Error(
+        `${asset.name} 可能是扫描版 PDF，当前版本无法读取图片中的文字，请先进行 OCR。`,
+      );
+    }
+    return text;
   }
 
   throw new Error(`暂不支持 .${ext || "未知"} 文件`);
-}
-
-function normalizeNumber(value: string) {
-  return value
-    .trim()
-    .replace(/,/g, "")
-    .replace(/\s+/g, "")
-    .replace(/％/g, "%")
-    .toLowerCase();
-}
-
-function numericPart(value: string) {
-  return normalizeNumber(value).replace(
-    /(%|ms|s|hz|khz|mhz|gb|mb|kb|℃|°c|kg|mm|cm|例|个|次|组)$/i,
-    "",
-  );
-}
-
-function categoryForClaim(context: string, rawValue: string) {
-  const text = context.toLowerCase();
-  if (/宏平均\s*f1|macro[-\s_]?f1|macro\s+f1/.test(text)) {
-    return { key: "macro_f1", label: "宏平均 F1" };
-  }
-  if (/准确率|accuracy|acc\b/.test(text)) {
-    return { key: "accuracy", label: "准确率" };
-  }
-  if (/精确率|precision/.test(text)) {
-    return { key: "precision", label: "精确率" };
-  }
-  if (/召回率|recall/.test(text)) {
-    return { key: "recall", label: "召回率" };
-  }
-  if (/\bauc\b|曲线下面积/.test(text)) return { key: "auc", label: "AUC" };
-  if (/测试集|test\s*(set|samples?)?/.test(text)) {
-    return { key: "test_samples", label: "测试集样本" };
-  }
-  if (/训练集|train(ing)?\s*(set|samples?)?/.test(text)) {
-    return { key: "train_samples", label: "训练集样本" };
-  }
-  if (/验证集|validation\s*(set|samples?)?/.test(text)) {
-    return { key: "validation_samples", label: "验证集样本" };
-  }
-  if (
-    /总样本|有效样本|纳入|包含|共计|样本量|participants?|subjects?/.test(
-      text,
-    )
-  ) {
-    return { key: "total_samples", label: "总样本量" };
-  }
-  if (/推理.*延迟|延迟|latency|inference\s*time/.test(text)) {
-    return { key: "latency", label: "推理延迟" };
-  }
-  if (/重复|实验次数|runs?|trials?/.test(text)) {
-    return { key: "runs", label: "重复次数" };
-  }
-  if (/p\s*[<=>]|p[_\s-]?value|显著性/.test(text)) {
-    return { key: "p_value", label: "P 值" };
-  }
-  if (/%|％/.test(rawValue)) {
-    return { key: "percentage", label: "百分比结果" };
-  }
-  return { key: "numeric_claim", label: "数值陈述" };
-}
-
-function getLineNumber(text: string, index: number) {
-  return text.slice(0, index).split(/\r?\n/).length;
-}
-
-const numberRegex =
-  /(?<![\w])(?:\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)(?:\s?(?:%|％|ms|s|Hz|kHz|MHz|GB|MB|KB|℃|°C|kg|mm|cm|例|个|次|组))?/gi;
-
-function sourceEntries(sourceTexts: { asset: Asset; text: string }[]) {
-  const semantic = new Map<string, SourceHit[]>();
-  const exact = new Map<string, SourceHit[]>();
-
-  sourceTexts.forEach(({ asset, text }) => {
-    text.split(/\r?\n/).forEach((lineText, lineIndex) => {
-      [...lineText.matchAll(numberRegex)].forEach((match) => {
-        const value = match[0];
-        const category = categoryForClaim(lineText, value);
-        const hit: SourceHit = {
-          key: category.key,
-          value,
-          file: asset.name,
-          line: lineIndex + 1,
-          excerpt: lineText.trim(),
-        };
-        semantic.set(category.key, [...(semantic.get(category.key) ?? []), hit]);
-        const exactKey = numericPart(value);
-        exact.set(exactKey, [...(exact.get(exactKey) ?? []), hit]);
-      });
-    });
-  });
-  return { semantic, exact };
-}
-
-function analyzeText(
-  manuscriptText: string,
-  sourceTexts: { asset: Asset; text: string }[],
-): Claim[] {
-  const { semantic, exact } = sourceEntries(sourceTexts);
-  const claims: Claim[] = [];
-  const sentences = [
-    ...manuscriptText.matchAll(/[^\n。！？!?]+(?:[。！？!?]|$)/g),
-  ];
-
-  sentences.forEach((sentenceMatch) => {
-    const sentence = sentenceMatch[0].trim();
-    if (!sentence) return;
-
-    [...sentence.matchAll(numberRegex)].forEach((valueMatch, valueIndex) => {
-      const rawValue = valueMatch[0];
-      const number = Number(numericPart(rawValue));
-      if (!Number.isFinite(number)) return;
-
-      const localIndex = valueMatch.index ?? 0;
-      const localContext = sentence.slice(
-        Math.max(0, localIndex - 24),
-        localIndex + rawValue.length + 16,
-      );
-      const category = categoryForClaim(localContext, rawValue);
-      const isLikelyYear =
-        number >= 1900 &&
-        number <= 2100 &&
-        !/%|％|样本|n\s*=|准确|f1|auc|p\s*[<=>]/i.test(localContext);
-      const isFigureNumber =
-        number < 20 &&
-        /^\s*(图|表|figure|fig\.?|table)\s*\d+/i.test(sentence);
-      if (isLikelyYear || isFigureNumber) return;
-
-      const semanticHits = semantic.get(category.key) ?? [];
-      const exactHits = exact.get(numericPart(rawValue)) ?? [];
-      const matchingSemantic = semanticHits.find(
-        (hit) => numericPart(hit.value) === numericPart(rawValue),
-      );
-
-      let status: ClaimStatus = "unverified";
-      let severity: Severity =
-        category.key === "numeric_claim" ? "low" : "medium";
-      let reason = "未在已提供的证据文件中找到相同数值。";
-      let suggestion = "确认该数值的来源，并补充对应数据文件或表格锚点。";
-      let source: SourceHit | undefined;
-
-      if (matchingSemantic) {
-        status = "supported";
-        severity = "low";
-        source = matchingSemantic;
-        reason = `在 ${matchingSemantic.file} 中找到语义一致的数值。`;
-        suggestion = "已建立证据锚点，提交前仍建议人工复核上下文。";
-      } else if (semanticHits.length > 0) {
-        status = "conflict";
-        severity = "high";
-        source = semanticHits[0];
-        reason = `证据文件中的${category.label}为 ${semanticHits[0].value}，与正文 ${rawValue} 不一致。`;
-        suggestion = "回查原始分析输出，统一正文、摘要、表格和图注中的数值。";
-      } else if (exactHits.length > 0) {
-        status = "supported";
-        severity = "low";
-        source = exactHits[0];
-        reason = `在 ${exactHits[0].file} 中找到相同数值，但语义标签需要人工确认。`;
-        suggestion = "检查来源行是否确实支持当前句子的含义。";
-      }
-
-      const sentenceOffset = sentenceMatch.index ?? 0;
-      claims.push({
-        id: `${sentenceOffset}-${localIndex}-${valueIndex}`,
-        key: category.key,
-        label: category.label,
-        value: rawValue,
-        context: sentence,
-        line: getLineNumber(manuscriptText, sentenceOffset),
-        status,
-        severity,
-        reason,
-        suggestion,
-        source,
-      });
-    });
-  });
-
-  const groups = new Map<string, Claim[]>();
-  claims.forEach((claim) => {
-    if (claim.key === "numeric_claim" || claim.key === "percentage") return;
-    groups.set(claim.key, [...(groups.get(claim.key) ?? []), claim]);
-  });
-
-  groups.forEach((items) => {
-    const distinct = new Set(items.map((item) => numericPart(item.value)));
-    if (distinct.size <= 1) return;
-    items.forEach((item) => {
-      if (item.status === "supported") return;
-      item.status = "conflict";
-      item.severity = "high";
-      item.reason = `稿件内出现多个${item.label}值：${[...distinct].join("、")}。${item.reason}`;
-      item.suggestion = "先解决稿件内部冲突，再与源数据进行最终核对。";
-    });
-  });
-  return claims;
-}
-
-function scoreClaims(claims: Claim[]) {
-  const penalty = claims.reduce((total, claim) => {
-    if (claim.status === "supported") return total;
-    if (claim.severity === "high") return total + 16;
-    if (claim.severity === "medium") return total + 7;
-    return total + 2;
-  }, 0);
-  return Math.max(12, Math.min(100, 100 - penalty));
 }
 
 function statusLabel(status: ClaimStatus) {
@@ -386,6 +178,7 @@ function severityLabel(severity: Severity) {
 
 export default function Home() {
   const manuscriptInput = useRef<HTMLInputElement>(null);
+  const scanGeneration = useRef(0);
   const [manuscript, setManuscript] = useState<Asset | null>(null);
   const [evidence, setEvidence] = useState<Asset[]>([]);
   const [phase, setPhase] = useState<
@@ -425,45 +218,71 @@ export default function Home() {
     };
   }, [result]);
 
-  function toAssets(files: FileList | File[]) {
-    return Array.from(files)
-      .filter((file) =>
-        ["docx", "pdf", "txt", "md", "csv", "tsv"].includes(
-          fileExtension(file.name),
-        ),
-      )
-      .map((file) => ({
-        name: file.name,
-        size: file.size,
-        type: file.type,
-        file,
-      }));
+  function toAsset(file: File): Asset {
+    return {
+      name: file.name,
+      size: file.size,
+      type: file.type,
+      identity: `${file.name}:${file.size}:${file.lastModified}`,
+      file,
+    };
   }
 
   function handleManuscript(files: FileList | File[]) {
-    const [first] = toAssets(files);
-    if (!first) {
+    const [file] = Array.from(files);
+    if (!file || !["docx", "pdf", "txt", "md"].includes(fileExtension(file.name))) {
       setError("请选择 DOCX、PDF、TXT 或 Markdown 文件。");
       return;
     }
-    setManuscript(first);
+    if (file.size > MAX_FILE_SIZE) {
+      setError(`单个稿件不能超过 ${formatBytes(MAX_FILE_SIZE)}。`);
+      return;
+    }
+    scanGeneration.current += 1;
+    setManuscript(toAsset(file));
     setResult(null);
     setPhase("ready");
     setError("");
   }
 
   function handleEvidence(files: FileList | File[]) {
-    const next = toAssets(files);
-    if (!next.length) {
+    const selected = Array.from(files);
+    const unsupported = selected.find(
+      (file) =>
+        !["docx", "pdf", "txt", "md", "csv", "tsv"].includes(
+          fileExtension(file.name),
+        ),
+    );
+    if (unsupported) {
       setError("请选择 CSV、TSV、TXT、DOCX 或 PDF 证据文件。");
       return;
     }
-    setEvidence((current) => [
-      ...current,
-      ...next.filter(
-        (asset) => !current.some((item) => item.name === asset.name),
-      ),
-    ]);
+    const oversized = selected.find((file) => file.size > MAX_FILE_SIZE);
+    if (oversized) {
+      setError(
+        `${oversized.name} 超过单文件 ${formatBytes(MAX_FILE_SIZE)} 的限制。`,
+      );
+      return;
+    }
+    const next = selected
+      .map(toAsset)
+      .filter(
+        (asset) => !evidence.some((item) => item.identity === asset.identity),
+      );
+    const combined = [...evidence, ...next];
+    if (combined.length > MAX_EVIDENCE_FILES) {
+      setError(`证据文件最多添加 ${MAX_EVIDENCE_FILES} 个。`);
+      return;
+    }
+    const totalSize = combined.reduce((total, asset) => total + asset.size, 0);
+    if (totalSize > MAX_TOTAL_EVIDENCE_SIZE) {
+      setError(
+        `证据文件总大小不能超过 ${formatBytes(MAX_TOTAL_EVIDENCE_SIZE)}。`,
+      );
+      return;
+    }
+    scanGeneration.current += 1;
+    setEvidence(combined);
     setResult(null);
     setPhase(manuscript ? "ready" : "idle");
     setError("");
@@ -489,22 +308,28 @@ export default function Home() {
     setError("");
     setPhase("scanning");
     setScanStep(0);
+    const scanId = scanGeneration.current + 1;
+    scanGeneration.current = scanId;
+    const shouldCancel = () => scanGeneration.current !== scanId;
 
     try {
-      const manuscriptText = await readAssetText(selectedManuscript);
+      const manuscriptText = await readAssetText(
+        selectedManuscript,
+        shouldCancel,
+      );
+      assertNotCancelled(shouldCancel);
       setScanStep(1);
-      await new Promise((resolve) => setTimeout(resolve, 280));
       const sourceTexts = await Promise.all(
         selectedEvidence.map(async (asset) => ({
-          asset,
-          text: await readAssetText(asset),
+          name: asset.name,
+          text: await readAssetText(asset, shouldCancel),
         })),
       );
+      assertNotCancelled(shouldCancel);
       setScanStep(2);
-      await new Promise((resolve) => setTimeout(resolve, 320));
       const claims = analyzeText(manuscriptText, sourceTexts);
+      assertNotCancelled(shouldCancel);
       setScanStep(3);
-      await new Promise((resolve) => setTimeout(resolve, 360));
       if (!claims.length) {
         throw new Error("没有识别到可核验的数值陈述，请换一份包含结果数据的稿件。");
       }
@@ -527,6 +352,7 @@ export default function Home() {
           ?.scrollIntoView({ behavior: "smooth", block: "start" });
       });
     } catch (scanError) {
+      if (scanError instanceof ScanCancelledError) return;
       setError(
         scanError instanceof Error ? scanError.message : "核验过程中发生错误。",
       );
@@ -534,11 +360,18 @@ export default function Home() {
     }
   }
 
+  function cancelScan() {
+    scanGeneration.current += 1;
+    setPhase("ready");
+    setError("核验已取消，文件仍保留在当前页面。");
+  }
+
   async function loadSample() {
     const sampleManuscript: Asset = {
       name: "robustness_study_draft.md",
       size: SAMPLE_MANUSCRIPT.length,
       type: "text/markdown",
+      identity: "sample-manuscript",
       text: SAMPLE_MANUSCRIPT,
     };
     const sampleEvidence: Asset[] = [
@@ -546,6 +379,7 @@ export default function Home() {
         name: "experiment_summary.csv",
         size: SAMPLE_CSV.length,
         type: "text/csv",
+        identity: "sample-evidence",
         text: SAMPLE_CSV,
       },
     ];
@@ -555,6 +389,7 @@ export default function Home() {
   }
 
   function resetScan() {
+    scanGeneration.current += 1;
     setManuscript(null);
     setEvidence([]);
     setResult(null);
@@ -600,7 +435,7 @@ export default function Home() {
     anchor.href = url;
     anchor.download = `EvidenceLock-${manuscript.name.replace(/\.[^.]+$/, "")}.md`;
     anchor.click();
-    URL.revokeObjectURL(url);
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
   const scanSteps = [
@@ -725,7 +560,10 @@ export default function Home() {
         <div className="workspace-heading">
           <div>
             <h2>把稿件和证据放在一起</h2>
-            <p>支持 DOCX、PDF、CSV、TSV、TXT 和 Markdown，单次本地处理。</p>
+            <p>
+              支持 DOCX、PDF、CSV、TSV、TXT 和 Markdown；单文件不超过 25
+              MB。
+            </p>
           </div>
           <div className="privacy-chip">
             <Lock size={14} />
@@ -757,7 +595,9 @@ export default function Home() {
                     asset={manuscript}
                     large
                     onRemove={() => {
+                      scanGeneration.current += 1;
                       setManuscript(null);
+                      setResult(null);
                       setPhase("idle");
                     }}
                   />
@@ -791,12 +631,17 @@ export default function Home() {
                     {evidence.map((asset) => (
                       <AssetCard
                         asset={asset}
-                        key={asset.name}
-                        onRemove={() =>
+                        key={asset.identity}
+                        onRemove={() => {
+                          scanGeneration.current += 1;
                           setEvidence((items) =>
-                            items.filter((item) => item.name !== asset.name),
+                            items.filter(
+                              (item) => item.identity !== asset.identity,
+                            ),
                           )
-                        }
+                          setResult(null);
+                          setPhase(manuscript ? "ready" : "idle");
+                        }}
                       />
                     ))}
                   </div>
@@ -831,6 +676,13 @@ export default function Home() {
                     }}
                   />
                 </div>
+                <button
+                  className="scan-cancel"
+                  type="button"
+                  onClick={cancelScan}
+                >
+                  取消核验
+                </button>
               </div>
             ) : (
               <div className="workspace-actions">
@@ -879,6 +731,9 @@ export default function Home() {
                   <p>
                     已读取 {result.filesRead} 个文件，识别{" "}
                     {result.claims.length} 条数值陈述 · {result.checkedAt}
+                  </p>
+                  <p className="score-note">
+                    分数按冲突、待核实与已支持条目的风险权重计算，不代表研究真实性。
                   </p>
                 </div>
               </div>
@@ -1123,9 +978,10 @@ function DropZone({
         type="file"
         accept={accept}
         multiple={multiple}
-        onChange={(event: ChangeEvent<HTMLInputElement>) =>
-          event.target.files && onFiles(event.target.files)
-        }
+        onChange={(event: ChangeEvent<HTMLInputElement>) => {
+          if (event.target.files) onFiles(event.target.files);
+          event.currentTarget.value = "";
+        }}
       />
       <span className="drop-icon">
         {icon === "manuscript" ? (
