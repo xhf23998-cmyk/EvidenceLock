@@ -17,6 +17,9 @@ export async function generateMetadata(): Promise<Metadata> {
     title: "EvidenceLock｜让每个数字找到证据",
     description:
       "在投稿前核对正文、图表与源数据，发现数字冲突、证据缺口和高风险陈述。",
+    icons: {
+      icon: "/favicon.svg",
+    },
     openGraph: {
       title: "EvidenceLock｜让每个数字找到证据",
       description: "科研交付物的证据链验收工具。",
