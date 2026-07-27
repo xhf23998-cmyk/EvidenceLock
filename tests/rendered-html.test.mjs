@@ -58,8 +58,15 @@ test("ships the local-first analysis workflow without starter residue", async ()
   assert.match(layout, /\/og\.png/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
   await access(new URL("../public/og.png", import.meta.url));
-  assert.deepEqual(
-    await readdir(new URL("../app/_sites-preview", import.meta.url)),
-    [],
-  );
+  let previewFiles = [];
+  try {
+    previewFiles = await readdir(
+      new URL("../app/_sites-preview", import.meta.url),
+    );
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
+  }
+  assert.deepEqual(previewFiles, []);
 });
